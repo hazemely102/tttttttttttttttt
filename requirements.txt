@@ -1,5 +1,5 @@
-python-telegram-bot>=20.0  # استخدم إصدارًا حديثًا
+python-telegram-bot>=20.0
 requests
 pycountry
-Flask
+Flask[async]  # <--- التغيير هنا
 gunicorn
