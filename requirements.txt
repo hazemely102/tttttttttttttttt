@@ -1,1 +1,5 @@
-python-telegram-bot requests pycountry Flask
+python-telegram-bot
+requests
+pycountry
+Flask
+gunicorn
