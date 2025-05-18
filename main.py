@@ -4,34 +4,62 @@ import urllib.parse
 import pycountry
 import logging
 import os
-from threading import Thread
+# from threading import Thread # لم نعد بحاجة لـ Thread
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes # لم نعد بحاجة لـ CallbackContext بشكل مباشر كثيرًا مع v20+
 from telegram.constants import ParseMode, ChatAction
 
-from flask import Flask
+from flask import Flask, request # استيراد request من Flask
 
 # --- إعدادات التسجيل ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO # يمكنك تغيير هذا إلى logging.DEBUG لرؤية المزيد من التفاصيل أثناء التطوير
 )
 logger = logging.getLogger(__name__)
 
 # --- التوكن الخاص بالبوت ---
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+if not BOT_TOKEN:
+    logger.critical("!!! TELEGRAM_BOT_TOKEN environment variable not set!")
+    # في بيئة الإنتاج، قد ترغب في الخروج أو رفع استثناء هنا
+    # exit() or raise EnvironmentError("TELEGRAM_BOT_TOKEN not set")
 
-# --- إعداد خادم الويب البسيط ---
-flask_app = Flask('')
+# --- تهيئة تطبيق python-telegram-bot ---
+# تأكد أن هذا يتم قبل تعريف مسارات Flask التي تستخدمه
+if BOT_TOKEN:
+    ptb_application = Application.builder().token(BOT_TOKEN).build()
+else:
+    ptb_application = None # أو تعامل مع هذا بشكل أفضل إذا لم يتم العثور على التوكن
 
-@flask_app.route('/')
-def home():
-    return "Bot is alive and running!"
+# --- إعداد تطبيق Flask ---
+# Gunicorn سيبحث عن هذا المتغير (أو الاسم الذي تحدده في أمر البدء)
+flask_app = Flask(__name__) # اسم المتغير 'flask_app' مهم لأمر البدء gunicorn main:flask_app
 
-def run_webserver():
-    port = int(os.environ.get("PORT", 8080))
-    flask_app.run(host='0.0.0.0', port=port)
+# --- مسار Webhook لاستقبال التحديثات من تليجرام ---
+@flask_app.route('/', methods=['POST']) # افترضنا أن الـ Webhook سيُرسل إلى المسار الجذر
+async def webhook_handler():
+    if not ptb_application:
+        logger.error("Telegram application not initialized (BOT_TOKEN missing?)")
+        return "Error: Bot not configured", 500
+
+    logger.info("Webhook received")
+    try:
+        update_data = request.get_json(force=True)
+        update = Update.de_json(data=update_data, bot=ptb_application.bot)
+        logger.debug(f"Update content: {update}") # سجل محتوى التحديث إذا كان debug mode مفعل
+        await ptb_application.process_update(update)
+        return 'OK', 200
+    except Exception as e:
+        logger.error(f"Error processing webhook: {e}", exc_info=True) # exc_info=True يضيف traceback للخطأ
+        return 'Error processing update', 500
+
+# --- مسار لفحص الصحة (Health Check) ولـ UptimeRobot ---
+@flask_app.route('/', methods=['GET']) # نفس المسار الجذر ولكن لطلبات GET
+def health_check():
+    logger.info("Health check / UptimeRobot ping received")
+    return "Bot is alive and processing webhooks!", 200
 
 # --- دالة تهريب Markdown V2 (عامة) ---
 def escape_markdown_v2(text: str) -> str:
@@ -223,16 +251,23 @@ def format_user_info_for_telegram(info: dict) -> str:
 
     return "\n".join(message_parts)
 
-# --- معالجات أوامر البوت ---
+# --- معالجات أوامر البوت (تضاف إلى ptb_application) ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"Received /start command from user {update.effective_user.id}")
     await update.message.reply_text(
         "أهلاً بك! 👋\n"
         "أرسل لي اسم مستخدم تيك توك (مثال: `@username` أو `username`) وسأجلب لك معلومات عنه.\n\n"
-        "مطور البوت: @MyTikInfoBot"
+        "مطور البوت: @MyTikInfoBot" # استبدل هذا إذا أردت
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text: # تحقق إضافي
+        logger.warning("Received an update without a message or text.")
+        return
+
     username_input = update.message.text.strip()
+    logger.info(f"Received message from user {update.effective_user.id}: {username_input}")
+
     if not username_input:
         await update.message.reply_text("الرجاء إرسال اسم مستخدم صالح.")
         return
@@ -240,26 +275,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     escaped_username_input = escape_markdown_v2(username_input)
     loading_message_text = f"⏳ جاري جلب المعلومات لـ '{escaped_username_input}'\\.\\.\\."
 
-    processing_message = None # قيمة افتراضية
+    processing_message = None
     try:
         processing_message = await update.message.reply_text(loading_message_text, parse_mode=ParseMode.MARKDOWN_V2)
     except Exception as e_loading_md:
         logger.error(f"Error sending loading message with Markdown: {e_loading_md}. Trying plain.")
         try:
-            processing_message = await update.message.reply_text(f"⏳ جاري جلب المعلومات لـ '{username_input}'...") # بدون تهريب إذا فشل الأول
+            processing_message = await update.message.reply_text(f"⏳ جاري جلب المعلومات لـ '{username_input}'...")
         except Exception as e_loading_plain:
             logger.error(f"FATAL: Could not send even plain loading message: {e_loading_plain}")
             await update.message.reply_text("⚠️ حدث خطأ فادح أثناء محاولة بدء طلبك. يرجى المحاولة مرة أخرى لاحقًا.")
             return
 
-    if not processing_message: # تحقق إضافي لضمان أن الرسالة أُرسلت
+    if not processing_message:
         logger.error("FATAL: processing_message is None after attempting to send. This should not happen.")
         await update.message.reply_text("⚠️ حدث خطأ داخلي غير متوقع (فشل إرسال رسالة الانتظار). يرجى المحاولة مرة أخرى.")
         return
 
     user_info = get_tiktok_user_info(username_input)
     formatted_message = format_user_info_for_telegram(user_info)
-
+    
     try:
         await context.bot.edit_message_text(
             chat_id=update.effective_chat.id,
@@ -270,17 +305,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e_edit_md:
         logger.error(f"Error editing message with Markdown: {e_edit_md}. Falling back to plain text.")
-
+        
         plain_text_message = formatted_message
-        # إزالة التهريب المزدوج والتهريب الأحادي لبعض الأحرف
         chars_to_clean = r'_*[]()~`>#+-.=|{}!' 
         for char_esc in chars_to_clean:
             plain_text_message = plain_text_message.replace(f'\\{char_esc}', char_esc) 
-
-        # إزالة علامات التنسيق الرئيسية التي لا تزال موجودة
-        for char_md in ['*', '`', '~', '[', ']', '(', ')']: # قد تحتاج إلى تعديل هذه القائمة
+        for char_md in ['*', '`', '~', '[', ']', '(', ')']:
             plain_text_message = plain_text_message.replace(char_md, '')
-
+            
         try:
             await context.bot.edit_message_text(
                 chat_id=update.effective_chat.id,
@@ -315,32 +347,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Error sending photo with plain caption: {e_photo_plain}")
                 await update.message.reply_text(f"❌ فشل في إرسال الصورة. التعليق: {caption_plain}")
 
-# --- الدالة الرئيسية لتشغيل البوت ---
-def run_bot_app():
-    if not BOT_TOKEN:
-        critical_msg = "!!! توكن البوت (TELEGRAM_BOT_TOKEN) غير موجود. يرجى تعيينه كـ Secret. !!!"
-        logger.critical(critical_msg)
-        print(critical_msg)
-        return
+# --- إضافة المعالجات إلى تطبيق ptb ---
+if ptb_application:
+    ptb_application.add_handler(CommandHandler("start", start_command))
+    ptb_application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    logger.info("Telegram handlers added.")
+else:
+    logger.warning("Telegram application not initialized, handlers not added.")
 
-    logger.info("🚀 البوت قيد التشغيل...")
-    print("🚀 البوت قيد التشغيل...")
-    application = Application.builder().token(BOT_TOKEN).build()
 
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    application.run_polling()
-    logger.info("البوت توقف.")
-    print("البوت توقف.")
-
+# --- الجزء الخاص بتشغيل Flask (عندما لا يكون Gunicorn هو المشغل) ---
+# هذا الجزء مفيد للاختبار المحلي فقط. Gunicorn سيتجاهله.
 if __name__ == '__main__':
     if not BOT_TOKEN:
-        print("!!! توكن البوت (TELEGRAM_BOT_TOKEN) غير موجود. يرجى تعيينه كـ Secret أولاً ثم إعادة تشغيل الـ Repl. !!!")
+        print("!!! TELEGRAM_BOT_TOKEN environment variable not set. Cannot run Flask server for bot. !!!")
+    elif not ptb_application:
+        print("!!! Telegram application (ptb_application) not initialized. Cannot run Flask server. !!!")
     else:
-        web_thread = Thread(target=run_webserver)
-        web_thread.daemon = True 
-        web_thread.start()
-        logger.info("🌐 خادم الويب الصغير يعمل في الخلفية...")
-        print("🌐 خادم الويب الصغير يعمل في الخلفية...")
-        run_bot_app()
+        # هذا لتشغيل خادم تطوير Flask إذا شغلت الملف مباشرة `python main.py`
+        # Render لن يستخدم هذا الجزء، بل سيستخدم أمر gunicorn.
+        logger.info("Starting Flask development server for local testing...")
+        # ptb_application.initialize() # تأكد من تهيئة التطبيق إذا لزم الأمر (عادةً ما يتم تلقائيًا)
+        
+        # قبل تشغيل Flask، يمكنك تعيين الـ webhook محليًا إذا كنت تستخدم ngrok للاختبار
+        # loop = asyncio.get_event_loop()
+        # if loop.is_running():
+        # logger.info("Event loop is running. Setting up bot for webhook.")
+        # await ptb_application.bot.set_webhook(url="YOUR_NGROK_URL_HERE") # <--- استبدل هذا
+        # else:
+        # logger.info("Event loop not running. Initializing application for webhook.")
+        # await ptb_application.initialize()
+        # await ptb_application.bot.set_webhook(url="YOUR_NGROK_URL_HERE") # <--- استبدل هذا
+
+        # للحصول على البورت من متغيرات البيئة أو استخدام قيمة افتراضية
+        port = int(os.environ.get("PORT", 8080)) # Render سيوفر متغير PORT
+        flask_app.run(host='0.0.0.0', port=port, debug=True) # debug=True للاختبار المحلي فقط
+        logger.info(f"Flask development server running on http://0.0.0.0:{port}")
