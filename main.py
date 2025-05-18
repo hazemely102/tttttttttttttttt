@@ -4,177 +4,50 @@ import urllib.parse
 import pycountry
 import logging
 import os
-import asyncio # قد نحتاجه إذا أردنا تشغيل initialize في سياق مختلف
+from threading import Thread
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.constants import ParseMode, ChatAction
 
-from flask import Flask, request
+from flask import Flask
 
 # --- إعدادات التسجيل ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO # DEBUG لرؤية المزيد
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
 # --- التوكن الخاص بالبوت ---
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
-# --- تهيئة تطبيق python-telegram-bot ---
-if not BOT_TOKEN:
-    logger.critical("!!! TELEGRAM_BOT_TOKEN environment variable not set!")
-    ptb_application = None
-else:
-    # بناء التطبيق. التهيئة ستتم لاحقًا.
-    ptb_application = Application.builder().token(BOT_TOKEN).build()
+# --- إعداد خادم الويب البسيط ---
+flask_app = Flask('')
 
-# --- إعداد تطبيق Flask ---
-flask_app = Flask(__name__)
+@flask_app.route('/')
+def home():
+    return "Bot is alive and running!"
 
-# --- دوال معالجات البوت ---
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Received /start command from user {update.effective_user.id}")
-    await update.message.reply_text(
-        "أهلاً بك! 👋\n"
-        "أرسل لي اسم مستخدم تيك توك (مثال: `@username` أو `username`) وسأجلب لك معلومات عنه.\n\n"
-        "مطور البوت: @MyTikInfoBot"
-    )
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        logger.warning("Received an update without a message or text.")
-        return
-
-    username_input = update.message.text.strip()
-    logger.info(f"Received message from user {update.effective_user.id}: {username_input}")
-
-    if not username_input:
-        await update.message.reply_text("الرجاء إرسال اسم مستخدم صالح.")
-        return
-
-    escaped_username_input = escape_markdown_v2(username_input)
-    loading_message_text = f"⏳ جاري جلب المعلومات لـ '{escaped_username_input}'\\.\\.\\."
-
-    processing_message = None
-    try:
-        processing_message = await update.message.reply_text(loading_message_text, parse_mode=ParseMode.MARKDOWN_V2)
-    except Exception as e_loading_md:
-        logger.error(f"Error sending loading message with Markdown: {e_loading_md}. Trying plain.")
-        try:
-            processing_message = await update.message.reply_text(f"⏳ جاري جلب المعلومات لـ '{username_input}'...")
-        except Exception as e_loading_plain:
-            logger.error(f"FATAL: Could not send even plain loading message: {e_loading_plain}")
-            await update.message.reply_text("⚠️ حدث خطأ فادح أثناء محاولة بدء طلبك. يرجى المحاولة مرة أخرى لاحقًا.")
-            return
-
-    if not processing_message:
-        logger.error("FATAL: processing_message is None after attempting to send. This should not happen.")
-        await update.message.reply_text("⚠️ حدث خطأ داخلي غير متوقع (فشل إرسال رسالة الانتظار). يرجى المحاولة مرة أخرى.")
-        return
-
-    user_info = get_tiktok_user_info(username_input) # افترض أن هذه دالة متزامنة
-    formatted_message = format_user_info_for_telegram(user_info)
-    
-    try:
-        await context.bot.edit_message_text(
-            chat_id=update.effective_chat.id,
-            message_id=processing_message.message_id,
-            text=formatted_message,
-            parse_mode=ParseMode.MARKDOWN_V2,
-            disable_web_page_preview=True
-        )
-    except Exception as e_edit_md:
-        logger.error(f"Error editing message with Markdown: {e_edit_md}. Falling back to plain text.")
-        plain_text_message = formatted_message
-        chars_to_clean = r'_*[]()~`>#+-.=|{}!' 
-        for char_esc in chars_to_clean: plain_text_message = plain_text_message.replace(f'\\{char_esc}', char_esc) 
-        for char_md in ['*', '`', '~', '[', ']', '(', ')']: plain_text_message = plain_text_message.replace(char_md, '')
-        try:
-            await context.bot.edit_message_text(
-                chat_id=update.effective_chat.id,
-                message_id=processing_message.message_id,
-                text=plain_text_message,
-                disable_web_page_preview=True)
-        except Exception as e_edit_plain:
-            logger.error(f"Error editing plain text message: {e_edit_plain}. Sending new message.")
-            await update.message.reply_text(plain_text_message, disable_web_page_preview=True)
-
-    if "error" not in user_info and user_info.get('profile_picture'):
-        pic_url = user_info['profile_picture']
-        caption_plain = f"صورة الملف الشخصي لـ @{user_info['username']}" 
-        caption_md = f"صورة الملف الشخصي لـ @{escape_markdown_v2(user_info['username'])}"
-        try:
-            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
-            await update.message.reply_photo(photo=pic_url, caption=caption_md, parse_mode=ParseMode.MARKDOWN_V2)
-        except Exception as e_photo_md:
-            logger.warning(f"Failed to send photo with Markdown caption: {e_photo_md}. Retrying with plain caption.")
-            try:
-                 await update.message.reply_photo(photo=pic_url, caption=caption_plain)
-            except Exception as e_photo_plain:
-                logger.error(f"Error sending photo with plain caption: {e_photo_plain}")
-                await update.message.reply_text(f"❌ فشل في إرسال الصورة. التعليق: {caption_plain}")
-
-# --- إضافة المعالجات إلى تطبيق ptb ---
-if ptb_application:
-    ptb_application.add_handler(CommandHandler("start", start_command))
-    ptb_application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("Telegram handlers added.")
-else:
-    logger.warning("Telegram application not initialized, handlers not added.")
-
-
-# --- مسار Webhook لاستقبال التحديثات من تليجرام ---
-@flask_app.route('/', methods=['POST'])
-async def webhook_handler():
-    global ptb_application # نحتاج إلى الوصول إلى ptb_application المعرف عالميًا
-    if not ptb_application:
-        logger.error("Telegram application not initialized (BOT_TOKEN missing?)")
-        return "Error: Bot not configured", 500
-
-    # التهيئة عند أول طلب إذا لم يتم تهيئته بالفعل
-    if not ptb_application.initialized:
-        try:
-            logger.info("Initializing PTB Application from webhook_handler...")
-            await ptb_application.initialize()
-            logger.info("PTB Application initialized successfully.")
-        except Exception as e_init:
-            logger.error(f"Error initializing PTB Application: {e_init}", exc_info=True)
-            return "Error initializing bot", 500
-    
-    logger.info("Webhook received")
-    try:
-        update_data = request.get_json(force=True)
-        update = Update.de_json(data=update_data, bot=ptb_application.bot)
-        # logger.debug(f"Update content: {update}") # يمكن تفعيله لرؤية محتوى التحديث
-        await ptb_application.process_update(update)
-        return 'OK', 200
-    except Exception as e:
-        logger.error(f"Error processing webhook: {e}", exc_info=True)
-        return 'Error processing update', 500
-
-# --- مسار لفحص الصحة (Health Check) ولـ UptimeRobot ---
-@flask_app.route('/', methods=['GET'])
-def health_check():
-    logger.info("Health check / UptimeRobot ping received")
-    return "Bot is alive and processing webhooks!", 200
-
-# --- الدوال المساعدة (تبقى كما هي) ---
+# --- دالة تهريب Markdown V2 (عامة) ---
 def escape_markdown_v2(text: str) -> str:
-    if not isinstance(text, str): return str(text)
+    if not isinstance(text, str):
+        return str(text)
     escape_chars = r'_*[]()~`>#+-.=|{}!'
     return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
 
+# --- دالة مساعدة لتحويل كود الدولة إلى اسم ---
 def get_country_name_from_code(code):
-    if not code or not isinstance(code, str) or len(code) != 2: return code
+    if not code or not isinstance(code, str) or len(code) != 2:
+        return code
     try:
         country = pycountry.countries.get(alpha_2=code.upper())
         return country.name if country else code
-    except Exception: return code
+    except Exception:
+        return code
 
+# --- دالة جلب معلومات تيك توك ---
 def get_tiktok_user_info(username):
-    # ... (الكود كما هو بدون تغيير) ...
     if username.startswith('@'):
         username = username[1:]
     url = f"https://www.tiktok.com/@{username}"
@@ -291,8 +164,8 @@ def get_tiktok_user_info(username):
     info['social_links'] = social_links
     return info
 
+# --- دالة لتنسيق المعلومات لإرسالها عبر تليجرام ---
 def format_user_info_for_telegram(info: dict) -> str:
-    # ... (الكود كما هو بدون تغيير) ...
     if "error" in info:
         return f"❌ خطأ: {info['error']}"
 
@@ -346,14 +219,128 @@ def format_user_info_for_telegram(info: dict) -> str:
 
     return "\n".join(message_parts)
 
-# --- الجزء الخاص بتشغيل Flask للاختبار المحلي ---
+# --- معالجات أوامر البوت ---
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "أهلاً بك! 👋\n"
+        "أرسل لي اسم مستخدم تيك توك (مثال: `@username` أو `username`) وسأجلب لك معلومات عنه.\n\n"
+        "مطور البوت: @MyTikInfoBot"
+    )
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    username_input = update.message.text.strip()
+    if not username_input:
+        await update.message.reply_text("الرجاء إرسال اسم مستخدم صالح.")
+        return
+
+    escaped_username_input = escape_markdown_v2(username_input)
+    loading_message_text = f"⏳ جاري جلب المعلومات لـ '{escaped_username_input}'\\.\\.\\."
+
+    processing_message = None # قيمة افتراضية
+    try:
+        processing_message = await update.message.reply_text(loading_message_text, parse_mode=ParseMode.MARKDOWN_V2)
+    except Exception as e_loading_md:
+        logger.error(f"Error sending loading message with Markdown: {e_loading_md}. Trying plain.")
+        try:
+            processing_message = await update.message.reply_text(f"⏳ جاري جلب المعلومات لـ '{username_input}'...") # بدون تهريب إذا فشل الأول
+        except Exception as e_loading_plain:
+            logger.error(f"FATAL: Could not send even plain loading message: {e_loading_plain}")
+            await update.message.reply_text("⚠️ حدث خطأ فادح أثناء محاولة بدء طلبك. يرجى المحاولة مرة أخرى لاحقًا.")
+            return
+
+    if not processing_message: # تحقق إضافي لضمان أن الرسالة أُرسلت
+        logger.error("FATAL: processing_message is None after attempting to send. This should not happen.")
+        await update.message.reply_text("⚠️ حدث خطأ داخلي غير متوقع (فشل إرسال رسالة الانتظار). يرجى المحاولة مرة أخرى.")
+        return
+
+    user_info = get_tiktok_user_info(username_input)
+    formatted_message = format_user_info_for_telegram(user_info)
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=processing_message.message_id,
+            text=formatted_message,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True
+        )
+    except Exception as e_edit_md:
+        logger.error(f"Error editing message with Markdown: {e_edit_md}. Falling back to plain text.")
+
+        plain_text_message = formatted_message
+        # إزالة التهريب المزدوج والتهريب الأحادي لبعض الأحرف
+        chars_to_clean = r'_*[]()~`>#+-.=|{}!' 
+        for char_esc in chars_to_clean:
+            plain_text_message = plain_text_message.replace(f'\\{char_esc}', char_esc) 
+
+        # إزالة علامات التنسيق الرئيسية التي لا تزال موجودة
+        for char_md in ['*', '`', '~', '[', ']', '(', ')']: # قد تحتاج إلى تعديل هذه القائمة
+            plain_text_message = plain_text_message.replace(char_md, '')
+
+        try:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=processing_message.message_id,
+                text=plain_text_message,
+                disable_web_page_preview=True
+            )
+        except Exception as e_edit_plain:
+            logger.error(f"Error editing plain text message: {e_edit_plain}. Sending new message.")
+            await update.message.reply_text(plain_text_message, disable_web_page_preview=True)
+
+
+    if "error" not in user_info and user_info.get('profile_picture'):
+        pic_url = user_info['profile_picture']
+        caption_plain = f"صورة الملف الشخصي لـ @{user_info['username']}" 
+        caption_md = f"صورة الملف الشخصي لـ @{escape_markdown_v2(user_info['username'])}"
+        try:
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
+            await update.message.reply_photo(
+                photo=pic_url,
+                caption=caption_md,
+                parse_mode=ParseMode.MARKDOWN_V2
+            )
+        except Exception as e_photo_md:
+            logger.warning(f"Failed to send photo with Markdown caption: {e_photo_md}. Retrying with plain caption.")
+            try:
+                 await update.message.reply_photo(
+                    photo=pic_url,
+                    caption=caption_plain
+                )
+            except Exception as e_photo_plain:
+                logger.error(f"Error sending photo with plain caption: {e_photo_plain}")
+                await update.message.reply_text(f"❌ فشل في إرسال الصورة. التعليق: {caption_plain}")
+
+# --- الدالة الرئيسية لتشغيل البوت ---
+def run_bot_app():
+    if not BOT_TOKEN:
+        critical_msg = "!!! توكن البوت (TELEGRAM_BOT_TOKEN) غير موجود. يرجى تعيينه كـ Secret. !!!"
+        logger.critical(critical_msg)
+        print(critical_msg)
+        return
+
+    logger.info("🚀 البوت قيد التشغيل...")
+    print("🚀 البوت قيد التشغيل...")
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    application.run_polling()
+    logger.info("البوت توقف.")
+    print("البوت توقف.")
+
 if __name__ == '__main__':
-    if not BOT_TOKEN or not ptb_application:
-        print("!!! BOT_TOKEN or ptb_application not set. Cannot run Flask dev server. !!!")
+    if not BOT_TOKEN:
+        print("!!! توكن البوت (TELEGRAM_BOT_TOKEN) غير موجود. يرجى تعيينه كـ Secret أولاً ثم إعادة تشغيل الـ Repl. !!!")
     else:
-        logger.info("Starting Flask development server for local testing...")
-        # ملاحظة: لا تقم بتعيين webhook هنا إلا إذا كنت تختبر محليًا مع ngrok
-        # وإلا سيتعارض مع الـ webhook الذي تم تعيينه لـ Render
+        # Start the bot in a background thread
+        bot_thread = Thread(target=run_bot_app)
+        bot_thread.daemon = True  # Daemon thread to exit when the main thread exits
+        bot_thread.start()
+
+        # Run the Flask app in the main thread to handle web requests
         port = int(os.environ.get("PORT", 8080))
-        flask_app.run(host='0.0.0.0', port=port, debug=True)
-        logger.info(f"Flask development server running on http://0.0.0.0:{port}")
+        logger.info(f"🌐 خادم الويب الصغير يعمل على المنفذ {port}...")
+        print(f"🌐 خادم الويب الصغير يعمل على المنفذ {port}...")
+        flask_app.run(host='0.0.0.0', port=port)
