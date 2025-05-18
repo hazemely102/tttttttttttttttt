@@ -1,4 +1,4 @@
-python-telegram-bot
+python-telegram-bot>=20.0  # استخدم إصدارًا حديثًا
 requests
 pycountry
 Flask
